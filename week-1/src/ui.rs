@@ -1,5 +1,8 @@
 use std::{
+    fs::OpenOptions,
     io,
+    io::Write,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -36,8 +39,28 @@ enum RequestState {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Direct,
+    StepByStep,
+    GeneratedPrompt,
+    Experts,
+}
+
+impl Mode {
+    fn index(self) -> usize {
+        match self {
+            Self::Direct => 0,
+            Self::StepByStep => 1,
+            Self::GeneratedPrompt => 2,
+            Self::Experts => 3,
+        }
+    }
+}
+
 enum ReplyEvent {
     Chunk(String),
+    ReplaceStream(String),
     Finished(String),
     Failed(String),
 }
@@ -58,6 +81,7 @@ enum Popup {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuKind {
+    Mode,
     Format,
 }
 
@@ -142,11 +166,13 @@ struct App {
     api_key: String,
     api_model: String,
     options: CompletionOptions,
+    mode: Mode,
     popup: Popup,
     history_top: usize,
     max_history_top: usize,
     history_page_height: usize,
     follow_history_tail: bool,
+    notice: Option<String>,
     frame: usize,
     quit: bool,
 }
@@ -165,11 +191,13 @@ impl App {
             api_key,
             api_model,
             options: CompletionOptions::default(),
+            mode: Mode::Direct,
             popup: Popup::None,
             history_top: 0,
             max_history_top: 0,
             history_page_height: 1,
             follow_history_tail: true,
+            notice: None,
             frame: 0,
             quit: false,
         }
@@ -287,6 +315,7 @@ impl App {
         if content.is_empty() {
             return;
         }
+        self.notice = None;
         self.clear_input();
 
         if content.starts_with('/') {
@@ -307,9 +336,10 @@ impl App {
         let model = self.api_model.clone();
         let messages = self.messages.clone();
         let options = self.options.clone();
+        let mode = self.mode;
         self.messages.push(Message::new(Role::Assistant, ""));
         tokio::spawn(async move {
-            run_request(api_url, api_key, model, messages, options, tx).await;
+            run_request(mode, api_url, api_key, model, messages, options, tx).await;
         });
     }
 
@@ -317,6 +347,13 @@ impl App {
         let (name, argument) = content.split_once(' ').unwrap_or((content, ""));
         let argument = argument.trim();
         match name.to_lowercase().as_str() {
+            "/mode" if argument.is_empty() => {
+                self.popup = Popup::Menu {
+                    kind: MenuKind::Mode,
+                    selected: self.mode.index(),
+                };
+                Ok(())
+            }
             "/format" if argument.is_empty() => {
                 self.popup = Popup::Menu {
                     kind: MenuKind::Format,
@@ -340,10 +377,28 @@ impl App {
                 self.popup = Popup::input(InputKind::Stop, initial);
                 Ok(())
             }
+            "/clear" if argument.is_empty() => {
+                self.messages.clear();
+                self.history_top = 0;
+                self.max_history_top = 0;
+                self.follow_history_tail = true;
+                self.notice = Some("История очищена".into());
+                Ok(())
+            }
+            "/save" if argument.is_empty() => {
+                let path = save_history(&self.messages)?;
+                self.notice = Some(format!("История сохранена: {}", path.display()));
+                Ok(())
+            }
             "/format" => self.set_format(argument),
             "/limit" => self.set_limit(argument),
             "/stop" => self.set_stop(argument),
-            _ => Err("Неизвестная команда. Доступны: /format, /limit, /stop".into()),
+            "/mode" => self.set_mode(argument),
+            "/clear" | "/save" => Err("Команда не принимает аргументы".into()),
+            _ => Err(
+                "Неизвестная команда. Доступны: /mode, /format, /limit, /stop, /clear, /save"
+                    .into(),
+            ),
         }
     }
 
@@ -483,6 +538,15 @@ impl App {
 
     fn apply_menu_choice(&mut self, kind: MenuKind, selected: usize) {
         match kind {
+            MenuKind::Mode => {
+                self.mode = [
+                    Mode::Direct,
+                    Mode::StepByStep,
+                    Mode::GeneratedPrompt,
+                    Mode::Experts,
+                ][selected.min(3)];
+                self.request_state = RequestState::Ready;
+            }
             MenuKind::Format => match selected {
                 0 => {
                     self.options.response_format = ResponseFormat::PlainText;
@@ -543,6 +607,19 @@ impl App {
         Ok(())
     }
 
+    fn set_mode(&mut self, argument: &str) -> Result<(), String> {
+        self.mode = match argument.to_lowercase().as_str() {
+            "direct" | "1" => Mode::Direct,
+            "step" | "step-by-step" | "2" => Mode::StepByStep,
+            "prompt" | "generated-prompt" | "3" => Mode::GeneratedPrompt,
+            "experts" | "expert" | "4" => Mode::Experts,
+            _ => {
+                return Err("Использование: /mode direct|step|prompt|experts (или 1|2|3|4)".into());
+            }
+        };
+        Ok(())
+    }
+
     fn receive_reply(&mut self) {
         if !matches!(self.request_state, RequestState::Waiting(_)) {
             return;
@@ -556,6 +633,15 @@ impl App {
                     }) = self.messages.last_mut()
                     {
                         answer.push_str(&content);
+                    }
+                }
+                ReplyEvent::ReplaceStream(content) => {
+                    if let Some(Message {
+                        role: Role::Assistant,
+                        content: answer,
+                    }) = self.messages.last_mut()
+                    {
+                        *answer = content;
                     }
                 }
                 ReplyEvent::Finished(content) => {
@@ -743,9 +829,15 @@ impl App {
             StopCondition::Natural => "выключен",
             StopCondition::Sequence(value) => value,
         };
+        let mode = match self.mode {
+            Mode::Direct => "direct",
+            Mode::StepByStep => "step",
+            Mode::GeneratedPrompt => "prompt",
+            Mode::Experts => "experts",
+        };
         frame.render_widget(
             Paragraph::new(format!(
-                " Формат: {format}  ·  Лимит: {limit}  ·  Stop: {stop}"
+                " Режим: {mode}  ·  Формат: {format}  ·  Лимит: {limit}  ·  Stop: {stop}"
             ))
             .style(Style::default().fg(Color::Cyan)),
             area,
@@ -759,8 +851,14 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             ),
             RequestState::Ready => (
-                " Enter — отправить · /format · /limit · /stop · Esc — выйти".into(),
-                Style::default().fg(Color::DarkGray),
+                self.notice.clone().unwrap_or_else(|| {
+                    " Enter — отправить · /mode · /format · /limit · /stop · /clear · /save · Esc — выйти".into()
+                }),
+                if self.notice.is_some() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
             ),
             RequestState::Failed(_) => (
                 " Повторите сообщение или исправьте команду".into(),
@@ -775,6 +873,15 @@ impl App {
             Popup::None => {}
             Popup::Menu { kind, selected } => {
                 let (title, items): (&str, [&str; 4]) = match kind {
+                    MenuKind::Mode => (
+                        " Режим решения ",
+                        [
+                            "1. Direct — прямой ответ",
+                            "2. Step — пошаговое решение",
+                            "3. Prompt — сначала создать промпт",
+                            "4. Experts — аналитик, инженер и критик",
+                        ],
+                    ),
                     MenuKind::Format => (
                         " Формат ответа ",
                         [
@@ -1154,6 +1261,53 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn save_history(messages: &[Message]) -> Result<PathBuf, String> {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let filename_format = time::format_description::parse_borrowed::<3>(
+        "history_[year]-[month]-[day]_[hour]-[minute]-[second]-[subsecond digits:3].md",
+    )
+    .map_err(|error| format!("Не удалось подготовить имя файла: {error}"))?;
+    let filename = now
+        .format(&filename_format)
+        .map_err(|error| format!("Не удалось сформировать имя файла: {error}"))?;
+    let path = PathBuf::from(filename);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("Не удалось создать {}: {error}", path.display()))?;
+    file.write_all(history_markdown(messages, now).as_bytes())
+        .map_err(|error| format!("Не удалось записать {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn history_markdown(messages: &[Message], saved_at: time::OffsetDateTime) -> String {
+    let display_format = time::format_description::parse_borrowed::<3>(
+        "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]",
+    )
+    .expect("static date format is valid");
+    let saved_at = saved_at
+        .format(&display_format)
+        .unwrap_or_else(|_| saved_at.to_string());
+    let mut output = format!("# История DeepSeek Chat\n\n_Сохранено: {saved_at}_\n\n");
+    for message in messages
+        .iter()
+        .filter(|message| !message.content.is_empty())
+    {
+        let role = match message.role {
+            Role::System => "Система",
+            Role::User => "Пользователь",
+            Role::Assistant => "DeepSeek",
+        };
+        output.push_str("## ");
+        output.push_str(role);
+        output.push_str("\n\n");
+        output.push_str(&message.content);
+        output.push_str("\n\n");
+    }
+    output
+}
+
 fn visible_input(value: &[char], cursor: usize, max_width: usize) -> (String, usize) {
     let mut start = cursor;
     let mut cursor_column = 0;
@@ -1180,6 +1334,7 @@ fn visible_input(value: &[char], cursor: usize, max_width: usize) -> (String, us
 }
 
 async fn run_request(
+    mode: Mode,
     api_url: String,
     api_key: String,
     model: String,
@@ -1187,12 +1342,86 @@ async fn run_request(
     options: CompletionOptions,
     tx: mpsc::UnboundedSender<ReplyEvent>,
 ) {
-    let result = stream_to_ui(&api_url, &api_key, &model, &messages, &options, &tx).await;
+    let result = match mode {
+        Mode::Direct => stream_to_ui(&api_url, &api_key, &model, &messages, &options, &tx).await,
+        Mode::StepByStep | Mode::Experts => {
+            let instruction = match mode {
+                Mode::StepByStep => {
+                    "Решай пошагово. Покажи ход решения, обоснуй каждый существенный шаг и в конце отдельно сформулируй итоговый ответ."
+                }
+                Mode::Experts => {
+                    "Создай группу из трёх экспертов: аналитика, инженера и критика. Каждый должен независимо предложить решение задачи в отдельном разделе. После этого кратко сопоставь их решения и сформулируй итог. Не пропускай ответ ни одного эксперта."
+                }
+                _ => unreachable!(),
+            };
+            let mut instructed_messages = Vec::with_capacity(messages.len() + 1);
+            instructed_messages.push(Message::new(Role::System, instruction));
+            instructed_messages.extend(messages);
+
+            stream_to_ui(
+                &api_url,
+                &api_key,
+                &model,
+                &instructed_messages,
+                &options,
+                &tx,
+            )
+            .await
+        }
+        Mode::GeneratedPrompt => {
+            solve_with_generated_prompt(&api_url, &api_key, &model, &messages, &options, &tx).await
+        }
+    };
+
     let event = match result {
         Ok(content) => ReplyEvent::Finished(content),
         Err(reason) => ReplyEvent::Failed(reason),
     };
     let _ = tx.send(event);
+}
+
+async fn solve_with_generated_prompt(
+    api_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    options: &CompletionOptions,
+    tx: &mpsc::UnboundedSender<ReplyEvent>,
+) -> Result<String, String> {
+    let task = messages
+        .last()
+        .map(|message| message.content.as_str())
+        .unwrap_or_default();
+    let prompt_request = [Message::new(
+        Role::User,
+        format!(
+            "Сначала составь максимально ясный и эффективный промпт для решения следующей задачи. \
+             Верни только готовый промпт, без решения и комментариев.\n\nЗадача:\n{task}"
+        ),
+    )];
+    let _ = tx.send(ReplyEvent::ReplaceStream(
+        "Составляю промпт для решения…\n\n".into(),
+    ));
+    let generated_prompt = stream_to_ui(
+        api_url,
+        api_key,
+        model,
+        &prompt_request,
+        &CompletionOptions::default(),
+        tx,
+    )
+    .await
+    .map_err(|reason| format!("Не удалось составить промпт: {reason}"))?;
+
+    let mut solution_messages = messages.to_vec();
+    solution_messages.pop();
+    solution_messages.push(Message::new(Role::User, generated_prompt));
+    let _ = tx.send(ReplyEvent::ReplaceStream(
+        "Промпт готов. Решаю задачу…\n\n".into(),
+    ));
+    stream_to_ui(api_url, api_key, model, &solution_messages, options, tx)
+        .await
+        .map_err(|reason| format!("Не удалось решить задачу созданным промптом: {reason}"))
 }
 
 async fn stream_to_ui(
@@ -1250,6 +1479,15 @@ mod tests {
     fn commands_without_arguments_open_popups() {
         let mut app = app();
 
+        app.apply_command("/mode").unwrap();
+        assert!(matches!(
+            app.popup,
+            Popup::Menu {
+                kind: MenuKind::Mode,
+                ..
+            }
+        ));
+
         app.apply_command("/format").unwrap();
         assert!(matches!(
             app.popup,
@@ -1290,6 +1528,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn all_four_modes_can_be_selected() {
+        let mut app = app();
+        for (command, expected) in [
+            ("/mode direct", Mode::Direct),
+            ("/mode step", Mode::StepByStep),
+            ("/mode prompt", Mode::GeneratedPrompt),
+            ("/mode experts", Mode::Experts),
+        ] {
+            app.apply_command(command).unwrap();
+            assert_eq!(app.mode, expected);
+        }
+        assert!(app.apply_command("/mode unknown").is_err());
     }
 
     #[test]
@@ -1360,5 +1613,36 @@ mod tests {
 
         assert!(rendered.contains("Вы ›"));
         assert!(!rendered.contains("DeepSeek ›"));
+    }
+
+    #[test]
+    fn clear_command_removes_history_and_resets_scroll() {
+        let mut app = app();
+        app.messages.push(Message::new(Role::User, "Старая задача"));
+        app.history_top = 10;
+        app.max_history_top = 20;
+        app.follow_history_tail = false;
+
+        app.apply_command("/clear").unwrap();
+
+        assert!(app.messages.is_empty());
+        assert_eq!(app.history_top, 0);
+        assert_eq!(app.max_history_top, 0);
+        assert!(app.follow_history_tail);
+        assert_eq!(app.notice.as_deref(), Some("История очищена"));
+    }
+
+    #[test]
+    fn history_export_preserves_roles_and_markdown() {
+        let messages = vec![
+            Message::new(Role::User, "Объясни **важное**"),
+            Message::new(Role::Assistant, "## Ответ\n\n- Первый пункт"),
+        ];
+        let saved_at = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
+        let markdown = history_markdown(&messages, saved_at);
+
+        assert!(markdown.starts_with("# История DeepSeek Chat"));
+        assert!(markdown.contains("## Пользователь\n\nОбъясни **важное**"));
+        assert!(markdown.contains("## DeepSeek\n\n## Ответ\n\n- Первый пункт"));
     }
 }
