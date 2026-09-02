@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    System,
     User,
     Assistant,
 }
@@ -26,20 +27,85 @@ impl Message {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponseFormat {
+    PlainText,
+    JsonObject(String),
+    Markdown(String),
+    Yaml(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LengthLimit {
+    Default,
+    MaxTokens(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopCondition {
+    Natural,
+    Sequence(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionOptions {
+    pub response_format: ResponseFormat,
+    pub length_limit: LengthLimit,
+    pub stop_condition: StopCondition,
+}
+
+impl Default for CompletionOptions {
+    fn default() -> Self {
+        Self {
+            response_format: ResponseFormat::PlainText,
+            length_limit: LengthLimit::Default,
+            stop_condition: StopCondition::Natural,
+        }
+    }
+}
+
 pub async fn complete(
     api_url: &str,
     api_key: &str,
     model: &str,
     messages: &[Message],
 ) -> Result<String, String> {
-    let client = client()?;
+    complete_with_options(
+        api_url,
+        api_key,
+        model,
+        messages,
+        &CompletionOptions::default(),
+    )
+    .await
+}
+
+pub async fn complete_with_options(
+    api_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    options: &CompletionOptions,
+) -> Result<String, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(format_http_error)?;
+
     let response = client
         .post(api_url)
         .bearer_auth(api_key)
-        .json(&request_value(model, messages, false))
+        .json(&request_value(model, messages, options, false))
         .send()
         .await
-        .map_err(map_send_error)?;
+        .map_err(|error| {
+            if error.is_builder() {
+                "Некорректный DEEPSEEK_API_URL".to_owned()
+            } else {
+                format_http_error(error)
+            }
+        })?;
+
     let status = response.status();
     let body = response.text().await.map_err(format_http_error)?;
     if status.is_success() {
@@ -54,18 +120,30 @@ pub async fn complete_streaming<F>(
     api_key: &str,
     model: &str,
     messages: &[Message],
+    options: &CompletionOptions,
     mut on_chunk: F,
 ) -> Result<String, String>
 where
     F: FnMut(&str),
 {
-    let mut response = client()?
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(format_http_error)?;
+    let mut response = client
         .post(api_url)
         .bearer_auth(api_key)
-        .json(&request_value(model, messages, true))
+        .json(&request_value(model, messages, options, true))
         .send()
         .await
-        .map_err(map_send_error)?;
+        .map_err(|error| {
+            if error.is_builder() {
+                "Некорректный DEEPSEEK_API_URL".to_owned()
+            } else {
+                format_http_error(error)
+            }
+        })?;
+
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.map_err(format_http_error)?;
@@ -84,6 +162,7 @@ where
     if !pending.is_empty() {
         process_sse_line(&pending, &mut answer, &mut on_chunk)?;
     }
+
     if answer.is_empty() {
         Err("DeepSeek API вернул пустой ответ".into())
     } else {
@@ -92,19 +171,41 @@ where
 }
 
 pub fn encode_request(model: &str, messages: &[Message]) -> String {
-    serde_json::to_string(&request_value(model, messages, false))
+    encode_request_with_options(model, messages, &CompletionOptions::default())
+}
+
+pub fn encode_request_with_options(
+    model: &str,
+    messages: &[Message],
+    options: &CompletionOptions,
+) -> String {
+    serde_json::to_string(&request_value(model, messages, options, false))
         .expect("request consists only of serializable values")
 }
 
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(format_http_error)
-}
+fn request_value(
+    model: &str,
+    messages: &[Message],
+    options: &CompletionOptions,
+    stream: bool,
+) -> Value {
+    let mut value = json!({
+        "model": model,
+        "messages": messages_with_instructions(messages, options),
+        "stream": stream,
+    });
+    let object = value.as_object_mut().expect("JSON literal is an object");
 
-fn request_value(model: &str, messages: &[Message], stream: bool) -> Value {
-    json!({ "model": model, "messages": messages, "stream": stream })
+    if matches!(options.response_format, ResponseFormat::JsonObject(_)) {
+        object.insert("response_format".into(), json!({"type": "json_object"}));
+    }
+    if let LengthLimit::MaxTokens(value) = options.length_limit {
+        object.insert("max_tokens".into(), json!(value));
+    }
+    if let StopCondition::Sequence(value) = &options.stop_condition {
+        object.insert("stop".into(), json!(value));
+    }
+    value
 }
 
 fn process_sse_line<F>(bytes: &[u8], answer: &mut String, on_chunk: &mut F) -> Result<(), String>
@@ -121,6 +222,7 @@ where
     if data == "[DONE]" || data.is_empty() {
         return Ok(());
     }
+
     let value: Value = serde_json::from_str(data)
         .map_err(|_| "Не удалось разобрать поток DeepSeek API".to_owned())?;
     if let Some(message) = value.pointer("/error/message").and_then(Value::as_str) {
@@ -151,21 +253,58 @@ pub fn decode_response(body: &str) -> Result<String, String> {
         content: String,
     }
 
-    serde_json::from_str::<Response>(body)
-        .map_err(|_| "Не удалось разобрать ответ DeepSeek API".to_owned())?
+    let response: Response = serde_json::from_str(body)
+        .map_err(|_| "Не удалось разобрать ответ DeepSeek API".to_owned())?;
+    let content = response
         .choices
         .into_iter()
         .next()
         .map(|choice| choice.message.content)
         .filter(|content| !content.is_empty())
-        .ok_or_else(|| "DeepSeek API вернул пустой ответ".to_owned())
+        .ok_or_else(|| "DeepSeek API вернул пустой ответ".to_owned())?;
+    Ok(content)
 }
 
-fn map_send_error(error: reqwest::Error) -> String {
-    if error.is_builder() {
-        "Некорректный DEEPSEEK_API_URL".to_owned()
-    } else {
-        format_http_error(error)
+fn messages_with_instructions(messages: &[Message], options: &CompletionOptions) -> Vec<Message> {
+    let instructions = [
+        format_instruction(&options.response_format),
+        stop_instruction(&options.stop_condition),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let mut result = Vec::with_capacity(messages.len() + usize::from(!instructions.is_empty()));
+    if !instructions.is_empty() {
+        result.push(Message::new(Role::System, instructions.join("\n")));
+    }
+    result.extend_from_slice(messages);
+    result
+}
+
+fn format_instruction(format: &ResponseFormat) -> Option<String> {
+    match format {
+        ResponseFormat::PlainText => None,
+        ResponseFormat::JsonObject(schema) => Some(format!(
+            "Формат ответа: только один валидный JSON-объект строго по заданной \
+             пользователем схеме: {schema}. Не добавляй другие поля, Markdown или текст вне JSON."
+        )),
+        ResponseFormat::Markdown(template) => Some(format!(
+            "Формат ответа: Markdown строго по заданному пользователем шаблону: {template}"
+        )),
+        ResponseFormat::Yaml(schema) => Some(format!(
+            "Формат ответа: только валидный YAML строго по заданной пользователем \
+             схеме: {schema}. Не добавляй Markdown или текст вне YAML."
+        )),
+    }
+}
+
+fn stop_instruction(condition: &StopCondition) -> Option<String> {
+    match condition {
+        StopCondition::Natural => None,
+        StopCondition::Sequence(value) => Some(format!(
+            "Условие завершения: сразу после полного ответа добавь маркер `{value}` и ничего не пиши после него."
+        )),
     }
 }
 
@@ -207,15 +346,79 @@ mod tests {
         assert!(body.contains("\"model\":\"deepseek-v4-flash\""));
         assert!(body.contains("\"role\":\"assistant\""));
         assert!(body.contains("Как дела?"));
-        assert!(!body.contains("max_tokens"));
     }
 
     #[test]
-    fn response_errors_are_reported() {
+    fn configured_request_contains_only_selected_parameters() {
+        let options = CompletionOptions {
+            response_format: ResponseFormat::JsonObject(
+                r#"{"car":"...","oil":["..."],"volume":"..."}"#.into(),
+            ),
+            length_limit: LengthLimit::MaxTokens(512),
+            stop_condition: StopCondition::Sequence("<END_OF_RESPONSE>".into()),
+        };
+        let body = encode_request_with_options(
+            "deepseek-v4-flash",
+            &[Message::new(Role::User, "Что такое Gleam?")],
+            &options,
+        );
+        assert!(body.contains("\"response_format\":{\"type\":\"json_object\"}"));
+        assert!(body.contains("\"max_tokens\":512"));
+        assert!(body.contains("\"stop\":\"<END_OF_RESPONSE>\""));
+        assert!(body.contains("\"role\":\"system\""));
+        assert!(!body.contains("\"temperature\""));
+        assert!(!body.contains("\"top_p\""));
+    }
+
+    #[test]
+    fn default_request_leaves_optional_parameters_to_api_defaults() {
+        let body = encode_request("deepseek-v4-flash", &[Message::new(Role::User, "Привет")]);
+        assert!(!body.contains("\"response_format\""));
+        assert!(!body.contains("\"max_tokens\""));
+        assert!(!body.contains("\"stop\""));
+        assert!(!body.contains("\"role\":\"system\""));
+    }
+
+    #[test]
+    fn markdown_format_is_only_a_system_instruction() {
+        let options = CompletionOptions {
+            response_format: ResponseFormat::Markdown("## Результат".into()),
+            ..CompletionOptions::default()
+        };
+        let body = encode_request_with_options(
+            "deepseek-v4-flash",
+            &[Message::new(Role::User, "Привет")],
+            &options,
+        );
+        assert!(body.contains("Markdown"));
+        assert!(!body.contains("\"response_format\""));
+    }
+
+    #[test]
+    fn response_content_is_decoded_without_format_validation() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"это не JSON"}}]}"#;
+        assert_eq!(decode_response(body), Ok("это не JSON".into()));
+    }
+
+    #[test]
+    fn empty_choices_are_rejected() {
         assert_eq!(
             decode_response(r#"{"choices":[]}"#),
             Err("DeepSeek API вернул пустой ответ".into())
         );
+    }
+
+    #[test]
+    fn empty_content_is_rejected() {
+        let body = r#"{"choices":[{"message":{"content":""}}]}"#;
+        assert_eq!(
+            decode_response(body),
+            Err("DeepSeek API вернул пустой ответ".into())
+        );
+    }
+
+    #[test]
+    fn malformed_response_is_rejected() {
         assert_eq!(
             decode_response("not JSON"),
             Err("Не удалось разобрать ответ DeepSeek API".into())
@@ -223,11 +426,18 @@ mod tests {
     }
 
     #[test]
-    fn streaming_request_and_chunks_are_supported() {
-        assert_eq!(
-            request_value("model", &[Message::new(Role::User, "Задача")], true)["stream"],
-            true
+    fn streaming_request_enables_stream_field() {
+        let value = request_value(
+            "deepseek-v4-flash",
+            &[Message::new(Role::User, "Задача")],
+            &CompletionOptions::default(),
+            true,
         );
+        assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn sse_chunks_are_decoded_and_accumulated() {
         let mut answer = String::new();
         let mut chunks = Vec::new();
         {
@@ -239,11 +449,12 @@ mod tests {
             )
             .unwrap();
             process_sse_line(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n",
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\r\n",
                 &mut answer,
                 &mut collect,
             )
             .unwrap();
+            process_sse_line(b"data: [DONE]\n", &mut answer, &mut collect).unwrap();
         }
         assert_eq!(answer, "Hello world");
         assert_eq!(chunks, ["Hello ", "world"]);
