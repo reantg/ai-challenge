@@ -47,11 +47,18 @@ pub enum StopCondition {
     Sequence(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Temperature {
+    Default,
+    Value(f64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompletionOptions {
     pub response_format: ResponseFormat,
     pub length_limit: LengthLimit,
     pub stop_condition: StopCondition,
+    pub temperature: Temperature,
 }
 
 impl Default for CompletionOptions {
@@ -60,6 +67,7 @@ impl Default for CompletionOptions {
             response_format: ResponseFormat::PlainText,
             length_limit: LengthLimit::Default,
             stop_condition: StopCondition::Natural,
+            temperature: Temperature::Default,
         }
     }
 }
@@ -204,6 +212,9 @@ fn request_value(
     }
     if let StopCondition::Sequence(value) = &options.stop_condition {
         object.insert("stop".into(), json!(value));
+    }
+    if let Temperature::Value(value) = options.temperature {
+        object.insert("temperature".into(), json!(value));
     }
     value
 }
@@ -356,6 +367,7 @@ mod tests {
             ),
             length_limit: LengthLimit::MaxTokens(512),
             stop_condition: StopCondition::Sequence("<END_OF_RESPONSE>".into()),
+            temperature: Temperature::Value(0.7),
         };
         let body = encode_request_with_options(
             "deepseek-v4-flash",
@@ -366,7 +378,7 @@ mod tests {
         assert!(body.contains("\"max_tokens\":512"));
         assert!(body.contains("\"stop\":\"<END_OF_RESPONSE>\""));
         assert!(body.contains("\"role\":\"system\""));
-        assert!(!body.contains("\"temperature\""));
+        assert!(body.contains("\"temperature\":0.7"));
         assert!(!body.contains("\"top_p\""));
     }
 
@@ -376,6 +388,7 @@ mod tests {
         assert!(!body.contains("\"response_format\""));
         assert!(!body.contains("\"max_tokens\""));
         assert!(!body.contains("\"stop\""));
+        assert!(!body.contains("\"temperature\""));
         assert!(!body.contains("\"role\":\"system\""));
     }
 
