@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::{
-    self, CompletionOptions, LengthLimit, Message, ResponseFormat, Role, StopCondition,
+    self, CompletionOptions, LengthLimit, Message, ResponseFormat, Role, StopCondition, Temperature,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(80);
@@ -92,6 +92,7 @@ enum InputKind {
     FormatYaml,
     Limit,
     Stop,
+    Temperature,
 }
 
 impl Popup {
@@ -377,6 +378,14 @@ impl App {
                 self.popup = Popup::input(InputKind::Stop, initial);
                 Ok(())
             }
+            "/temperature" if argument.is_empty() => {
+                let initial = match self.options.temperature {
+                    Temperature::Default => "default".into(),
+                    Temperature::Value(value) => value.to_string(),
+                };
+                self.popup = Popup::input(InputKind::Temperature, initial);
+                Ok(())
+            }
             "/clear" if argument.is_empty() => {
                 self.messages.clear();
                 self.history_top = 0;
@@ -393,10 +402,11 @@ impl App {
             "/format" => self.set_format(argument),
             "/limit" => self.set_limit(argument),
             "/stop" => self.set_stop(argument),
+            "/temperature" => self.set_temperature(argument),
             "/mode" => self.set_mode(argument),
             "/clear" | "/save" => Err("Команда не принимает аргументы".into()),
             _ => Err(
-                "Неизвестная команда. Доступны: /mode, /format, /limit, /stop, /clear, /save"
+                "Неизвестная команда. Доступны: /mode, /format, /limit, /stop, /temperature, /clear, /save"
                     .into(),
             ),
         }
@@ -580,6 +590,7 @@ impl App {
             }
             InputKind::Limit => self.set_limit(value),
             InputKind::Stop => self.set_stop(value),
+            InputKind::Temperature => self.set_temperature(value),
         }
     }
 
@@ -603,6 +614,19 @@ impl App {
             return Err("Использование: /stop <последовательность>|off".into());
         } else {
             StopCondition::Sequence(argument.into())
+        };
+        Ok(())
+    }
+
+    fn set_temperature(&mut self, argument: &str) -> Result<(), String> {
+        self.options.temperature = match argument.to_lowercase().as_str() {
+            "default" | "off" => Temperature::Default,
+            value => match value.parse::<f64>() {
+                Ok(value) if value.is_finite() && (0.0..=2.0).contains(&value) => {
+                    Temperature::Value(value)
+                }
+                _ => return Err("Использование: /temperature <число от 0 до 2>|default".into()),
+            },
         };
         Ok(())
     }
@@ -829,6 +853,10 @@ impl App {
             StopCondition::Natural => "выключен",
             StopCondition::Sequence(value) => value,
         };
+        let temperature = match self.options.temperature {
+            Temperature::Default => "по умолчанию".into(),
+            Temperature::Value(value) => value.to_string(),
+        };
         let mode = match self.mode {
             Mode::Direct => "direct",
             Mode::StepByStep => "step",
@@ -837,7 +865,7 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(format!(
-                " Режим: {mode}  ·  Формат: {format}  ·  Лимит: {limit}  ·  Stop: {stop}"
+                " Режим: {mode}  ·  Формат: {format}  ·  Лимит: {limit}  ·  Stop: {stop}  ·  Температура: {temperature}"
             ))
             .style(Style::default().fg(Color::Cyan)),
             area,
@@ -852,7 +880,7 @@ impl App {
             ),
             RequestState::Ready => (
                 self.notice.clone().unwrap_or_else(|| {
-                    " Enter — отправить · /mode · /format · /limit · /stop · /clear · /save · Esc — выйти".into()
+                    " Enter — отправить · /mode · /format · /limit · /stop · /temperature · /clear · /save · Esc — выйти".into()
                 }),
                 if self.notice.is_some() {
                     Style::default().fg(Color::Green)
@@ -939,6 +967,7 @@ impl App {
                     InputKind::FormatYaml => (" YAML-схема ", "Введите описание YAML-схемы"),
                     InputKind::Limit => (" Лимит токенов ", "Число, default или off"),
                     InputKind::Stop => (" Stop sequence ", "Последовательность или off"),
+                    InputKind::Temperature => (" Температура ", "Число от 0 до 2, default или off"),
                 };
                 let area = centered_rect(70, 7, frame.area());
                 frame.render_widget(Clear, area);
@@ -1402,12 +1431,16 @@ async fn solve_with_generated_prompt(
     let _ = tx.send(ReplyEvent::ReplaceStream(
         "Составляю промпт для решения…\n\n".into(),
     ));
+    let prompt_options = CompletionOptions {
+        temperature: options.temperature,
+        ..CompletionOptions::default()
+    };
     let generated_prompt = stream_to_ui(
         api_url,
         api_key,
         model,
         &prompt_request,
-        &CompletionOptions::default(),
+        &prompt_options,
         tx,
     )
     .await
@@ -1454,6 +1487,7 @@ mod tests {
             .unwrap();
         app.apply_command("/limit 512").unwrap();
         app.apply_command("/stop <END>").unwrap();
+        app.apply_command("/temperature 0.7").unwrap();
 
         assert!(matches!(
             app.options.response_format,
@@ -1464,6 +1498,7 @@ mod tests {
             app.options.stop_condition,
             StopCondition::Sequence("<END>".into())
         );
+        assert_eq!(app.options.temperature, Temperature::Value(0.7));
         assert!(app.messages.is_empty());
     }
 
@@ -1472,6 +1507,9 @@ mod tests {
         let mut app = app();
         assert!(app.apply_command("/format yaml").is_err());
         assert!(app.apply_command("/limit 0").is_err());
+        assert!(app.apply_command("/temperature -0.1").is_err());
+        assert!(app.apply_command("/temperature 2.1").is_err());
+        assert!(app.apply_command("/temperature NaN").is_err());
         assert!(app.apply_command("/unknown").is_err());
     }
 
@@ -1528,6 +1566,29 @@ mod tests {
                 ..
             }
         ));
+
+        app.apply_command("/temperature").unwrap();
+        assert!(matches!(
+            app.popup,
+            Popup::Input {
+                kind: InputKind::Temperature,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn temperature_accepts_boundaries_and_can_be_reset() {
+        let mut app = app();
+
+        app.apply_command("/temperature 0").unwrap();
+        assert_eq!(app.options.temperature, Temperature::Value(0.0));
+
+        app.apply_command("/temperature 2").unwrap();
+        assert_eq!(app.options.temperature, Temperature::Value(2.0));
+
+        app.apply_command("/temperature default").unwrap();
+        assert_eq!(app.options.temperature, Temperature::Default);
     }
 
     #[test]
