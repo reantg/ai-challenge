@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header::ACCEPT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -70,6 +70,74 @@ impl Default for CompletionOptions {
             temperature: Temperature::Default,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    object: String,
+    data: Vec<ModelSummary>,
+}
+
+#[derive(Deserialize)]
+struct ModelSummary {
+    object: String,
+    #[serde(rename = "owned_by")]
+    _owned_by: String,
+    id: String,
+}
+
+pub async fn list_models(api_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let models_url = models_url(api_url)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(format_http_error)?;
+    let response = client
+        .get(models_url)
+        .header(ACCEPT, "application/json")
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(format_http_error)?;
+    let status = response.status();
+    let body = response.text().await.map_err(format_http_error)?;
+    if !status.is_success() {
+        return Err(format_api_error(status, &body));
+    }
+
+    let models = decode_models_response(&body)?;
+    if models.is_empty() {
+        Err("DeepSeek API вернул пустой список моделей".into())
+    } else {
+        Ok(models)
+    }
+}
+
+fn models_url(api_url: &str) -> Result<reqwest::Url, String> {
+    let mut url =
+        reqwest::Url::parse(api_url).map_err(|_| "Некорректный DEEPSEEK_API_URL".to_owned())?;
+    let path = url.path().trim_end_matches('/');
+    let prefix = path
+        .strip_suffix("/chat/completions")
+        .ok_or_else(|| "DEEPSEEK_API_URL должен оканчиваться на /chat/completions".to_owned())?;
+    url.set_path(&format!("{prefix}/models"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn decode_models_response(body: &str) -> Result<Vec<String>, String> {
+    let response = serde_json::from_str::<ModelsResponse>(body)
+        .map_err(|_| "Не удалось разобрать список моделей DeepSeek API".to_owned())?;
+    if response.object != "list" || response.data.iter().any(|model| model.object != "model") {
+        return Err("DeepSeek API вернул некорректный список моделей".into());
+    }
+    Ok(response
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .filter(|id| !id.is_empty())
+        .collect())
 }
 
 pub async fn complete(
@@ -405,6 +473,38 @@ mod tests {
         );
         assert!(body.contains("Markdown"));
         assert!(!body.contains("\"response_format\""));
+    }
+
+    #[test]
+    fn models_url_reuses_completion_api_prefix() {
+        let url = models_url("https://api.example.com/v1/chat/completions?source=test").unwrap();
+
+        assert_eq!(url.as_str(), "https://api.example.com/v1/models");
+    }
+
+    #[test]
+    fn model_list_decodes_available_identifiers() {
+        let models = decode_models_response(
+            r#"{"object":"list","data":[
+                {"id":"deepseek-v4-flash","object":"model","owned_by":"deepseek"},
+                {"id":"deepseek-v4-pro","object":"model","owned_by":"deepseek"}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(models, ["deepseek-v4-flash", "deepseek-v4-pro"]);
+    }
+
+    #[test]
+    fn model_list_rejects_unexpected_object_types() {
+        let error = decode_models_response(
+            r#"{"object":"model","data":[
+                {"id":"deepseek-v4-pro","object":"list","owned_by":"deepseek"}
+            ]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "DeepSeek API вернул некорректный список моделей");
     }
 
     #[test]
