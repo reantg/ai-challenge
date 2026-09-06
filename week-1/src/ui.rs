@@ -35,8 +35,15 @@ const MAX_INPUT_CHARS: usize = 4000;
 
 enum RequestState {
     Ready,
+    LoadingModels(Instant),
     Waiting(Instant),
     Failed(String),
+}
+
+impl RequestState {
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::LoadingModels(_) | Self::Waiting(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +66,7 @@ impl Mode {
 }
 
 enum ReplyEvent {
+    ModelsLoaded(Result<Vec<String>, String>),
     Chunk(String),
     ReplaceStream(String),
     Finished(String),
@@ -81,6 +89,7 @@ enum Popup {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuKind {
+    Model,
     Mode,
     Format,
 }
@@ -166,6 +175,7 @@ struct App {
     api_url: String,
     api_key: String,
     api_model: String,
+    available_models: Vec<String>,
     options: CompletionOptions,
     mode: Mode,
     popup: Popup,
@@ -191,6 +201,7 @@ impl App {
             api_url,
             api_key,
             api_model,
+            available_models: Vec::new(),
             options: CompletionOptions::default(),
             mode: Mode::Direct,
             popup: Popup::None,
@@ -242,7 +253,7 @@ impl App {
             }
             _ => {}
         }
-        if matches!(self.request_state, RequestState::Waiting(_)) {
+        if self.request_state.is_busy() {
             return;
         }
 
@@ -283,9 +294,7 @@ impl App {
     }
 
     fn insert_char(&mut self, character: char) {
-        if self.input.len() < MAX_INPUT_CHARS
-            && !matches!(self.request_state, RequestState::Waiting(_))
-        {
+        if self.input.len() < MAX_INPUT_CHARS && !self.request_state.is_busy() {
             self.input.insert(self.cursor, character);
             self.cursor += 1;
         }
@@ -322,7 +331,7 @@ impl App {
         if content.starts_with('/') {
             if let Err(reason) = self.apply_command(&content) {
                 self.request_state = RequestState::Failed(reason);
-            } else {
+            } else if !self.request_state.is_busy() {
                 self.request_state = RequestState::Ready;
             }
             return;
@@ -348,6 +357,17 @@ impl App {
         let (name, argument) = content.split_once(' ').unwrap_or((content, ""));
         let argument = argument.trim();
         match name.to_lowercase().as_str() {
+            "/model" if argument.is_empty() => {
+                self.request_state = RequestState::LoadingModels(Instant::now());
+                let api_url = self.api_url.clone();
+                let api_key = self.api_key.clone();
+                let tx = self.reply_tx.clone();
+                tokio::spawn(async move {
+                    let result = api::list_models(&api_url, &api_key).await;
+                    let _ = tx.send(ReplyEvent::ModelsLoaded(result));
+                });
+                Ok(())
+            }
             "/mode" if argument.is_empty() => {
                 self.popup = Popup::Menu {
                     kind: MenuKind::Mode,
@@ -404,9 +424,9 @@ impl App {
             "/stop" => self.set_stop(argument),
             "/temperature" => self.set_temperature(argument),
             "/mode" => self.set_mode(argument),
-            "/clear" | "/save" => Err("Команда не принимает аргументы".into()),
+            "/model" | "/clear" | "/save" => Err("Команда не принимает аргументы".into()),
             _ => Err(
-                "Неизвестная команда. Доступны: /mode, /format, /limit, /stop, /temperature, /clear, /save"
+                "Неизвестная команда. Доступны: /model, /mode, /format, /limit, /stop, /temperature, /clear, /save"
                     .into(),
             ),
         }
@@ -436,7 +456,15 @@ impl App {
         match popup {
             Popup::None => {}
             Popup::Menu { kind, mut selected } => {
-                let count = 4;
+                let count = match kind {
+                    MenuKind::Model => self.available_models.len(),
+                    MenuKind::Mode | MenuKind::Format => 4,
+                };
+                if count == 0 {
+                    self.request_state =
+                        RequestState::Failed("DeepSeek API вернул пустой список моделей".into());
+                    return;
+                }
                 match key.code {
                     KeyCode::Esc => self.request_state = RequestState::Ready,
                     KeyCode::Up => {
@@ -447,8 +475,13 @@ impl App {
                         selected = (selected + 1) % count;
                         self.popup = Popup::Menu { kind, selected };
                     }
-                    KeyCode::Char(value @ '1'..='4') => {
-                        self.apply_menu_choice(kind, value as usize - '1' as usize);
+                    KeyCode::Char(value @ '1'..='9') => {
+                        let choice = value as usize - '1' as usize;
+                        if choice < count {
+                            self.apply_menu_choice(kind, choice);
+                        } else {
+                            self.popup = Popup::Menu { kind, selected };
+                        }
                     }
                     KeyCode::Enter => self.apply_menu_choice(kind, selected),
                     _ => self.popup = Popup::Menu { kind, selected },
@@ -548,6 +581,14 @@ impl App {
 
     fn apply_menu_choice(&mut self, kind: MenuKind, selected: usize) {
         match kind {
+            MenuKind::Model => {
+                if let Some(model) = self.available_models.get(selected) {
+                    self.api_model.clone_from(model);
+                    self.request_state = RequestState::Ready;
+                } else {
+                    self.request_state = RequestState::Failed("Не удалось выбрать модель".into());
+                }
+            }
             MenuKind::Mode => {
                 self.mode = [
                     Mode::Direct,
@@ -645,11 +686,26 @@ impl App {
     }
 
     fn receive_reply(&mut self) {
-        if !matches!(self.request_state, RequestState::Waiting(_)) {
+        if !self.request_state.is_busy() {
             return;
         }
         while let Ok(event) = self.reply_rx.try_recv() {
             match event {
+                ReplyEvent::ModelsLoaded(result) => match result {
+                    Ok(models) => {
+                        let selected = models
+                            .iter()
+                            .position(|model| model == &self.api_model)
+                            .unwrap_or(0);
+                        self.available_models = models;
+                        self.popup = Popup::Menu {
+                            kind: MenuKind::Model,
+                            selected,
+                        };
+                        self.request_state = RequestState::Ready;
+                    }
+                    Err(reason) => self.request_state = RequestState::Failed(reason),
+                },
                 ReplyEvent::Chunk(content) => {
                     if let Some(Message {
                         role: Role::Assistant,
@@ -693,7 +749,7 @@ impl App {
                     self.request_state = RequestState::Failed(reason);
                 }
             }
-            if !matches!(self.request_state, RequestState::Waiting(_)) {
+            if !self.request_state.is_busy() {
                 break;
             }
         }
@@ -749,6 +805,20 @@ impl App {
                 Span::styled(
                     format!(
                         "{} DeepSeek отвечает ({})",
+                        SPINNER[self.frame % SPINNER.len()],
+                        format_elapsed(started_at.elapsed())
+                    ),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]));
+        }
+        if let RequestState::LoadingModels(started_at) = &self.request_state {
+            const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            lines.push(Line::from(vec![
+                Span::raw("           "),
+                Span::styled(
+                    format!(
+                        "{} Загружаю модели ({})",
                         SPINNER[self.frame % SPINNER.len()],
                         format_elapsed(started_at.elapsed())
                     ),
@@ -830,7 +900,7 @@ impl App {
         };
         frame.render_widget(Paragraph::new(shown), inner);
 
-        if !matches!(self.request_state, RequestState::Waiting(_)) && inner.width > 0 {
+        if !self.request_state.is_busy() && inner.width > 0 {
             let before_cursor = self.input[..self.cursor].iter().collect::<String>();
             let offset = 2 + before_cursor.width();
             let x = inner.x + (offset as u16).min(inner.width.saturating_sub(1));
@@ -865,7 +935,8 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(format!(
-                " Режим: {mode}  ·  Формат: {format}  ·  Лимит: {limit}  ·  Stop: {stop}  ·  Температура: {temperature}"
+                " Модель: {}  ·  Режим: {mode}  ·  Формат: {format}  ·  Лимит: {limit}  ·  Stop: {stop}  ·  Температура: {temperature}",
+                self.api_model
             ))
             .style(Style::default().fg(Color::Cyan)),
             area,
@@ -874,13 +945,17 @@ impl App {
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let (text, style): (String, Style) = match &self.request_state {
+            RequestState::LoadingModels(_) => (
+                " Загружается список моделей · Esc — выйти".into(),
+                Style::default().fg(Color::DarkGray),
+            ),
             RequestState::Waiting(_) => (
                 " Ответ формируется в ленте · ↑/↓ — прокрутка · Esc — выйти".into(),
                 Style::default().fg(Color::DarkGray),
             ),
             RequestState::Ready => (
                 self.notice.clone().unwrap_or_else(|| {
-                    " Enter — отправить · /mode · /format · /limit · /stop · /temperature · /clear · /save · Esc — выйти".into()
+                    " Enter — отправить · /model · /mode · /format · /limit · /stop · /temperature · /clear · /save · Esc — выйти".into()
                 }),
                 if self.notice.is_some() {
                     Style::default().fg(Color::Green)
@@ -900,7 +975,15 @@ impl App {
         match &self.popup {
             Popup::None => {}
             Popup::Menu { kind, selected } => {
-                let (title, items): (&str, [&str; 4]) = match kind {
+                let (title, items) = match kind {
+                    MenuKind::Model => (
+                        " Модель ",
+                        self.available_models
+                            .iter()
+                            .enumerate()
+                            .map(|(index, model)| format!("{}. {model}", index + 1))
+                            .collect::<Vec<_>>(),
+                    ),
                     MenuKind::Mode => (
                         " Режим решения ",
                         [
@@ -908,7 +991,9 @@ impl App {
                             "2. Step — пошаговое решение",
                             "3. Prompt — сначала создать промпт",
                             "4. Experts — аналитик, инженер и критик",
-                        ],
+                        ]
+                        .map(str::to_owned)
+                        .to_vec(),
                     ),
                     MenuKind::Format => (
                         " Формат ответа ",
@@ -917,14 +1002,26 @@ impl App {
                             "2. JSON — ввести схему",
                             "3. Markdown — ввести шаблон",
                             "4. YAML — ввести схему",
-                        ],
+                        ]
+                        .map(str::to_owned)
+                        .to_vec(),
                     ),
                 };
-                let area = centered_rect(62, 9, frame.area());
+                let requested_height = u16::try_from(items.len())
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(5);
+                let area = centered_rect(70, requested_height, frame.area());
                 frame.render_widget(Clear, area);
+                let visible_count = usize::from(area.height.saturating_sub(5)).max(1);
+                let start = selected
+                    .saturating_add(1)
+                    .saturating_sub(visible_count)
+                    .min(items.len().saturating_sub(visible_count));
                 let lines = items
                     .iter()
                     .enumerate()
+                    .skip(start)
+                    .take(visible_count)
                     .map(|(index, item)| {
                         let marker = if index == *selected { "› " } else { "  " };
                         let style = if index == *selected {
@@ -952,7 +1049,8 @@ impl App {
                     ),
                     area,
                 );
-                frame.set_cursor_position((area.x + 1, area.y + 1 + *selected as u16));
+                let cursor_row = selected.saturating_sub(start) as u16;
+                frame.set_cursor_position((area.x + 1, area.y + 1 + cursor_row));
             }
             Popup::Input {
                 kind,
@@ -1511,6 +1609,54 @@ mod tests {
         assert!(app.apply_command("/temperature 2.1").is_err());
         assert!(app.apply_command("/temperature NaN").is_err());
         assert!(app.apply_command("/unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn model_command_loads_choices_and_selected_model_enters_api_request() {
+        let mut app = app();
+
+        app.apply_command("/model").unwrap();
+        assert!(matches!(app.request_state, RequestState::LoadingModels(_)));
+
+        app.reply_tx
+            .send(ReplyEvent::ModelsLoaded(Ok(vec![
+                "deepseek-v4-flash".into(),
+                "deepseek-v4-pro".into(),
+            ])))
+            .unwrap();
+        app.receive_reply();
+        assert!(matches!(
+            app.popup,
+            Popup::Menu {
+                kind: MenuKind::Model,
+                selected: 0,
+            }
+        ));
+
+        app.apply_menu_choice(MenuKind::Model, 1);
+        let body = api::encode_request(
+            &app.api_model,
+            &[Message::new(Role::User, "Проверка модели")],
+        );
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["model"], "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn model_loading_error_is_shown_without_changing_model() {
+        let mut app = app();
+        app.request_state = RequestState::LoadingModels(Instant::now());
+        app.reply_tx
+            .send(ReplyEvent::ModelsLoaded(Err("Список недоступен".into())))
+            .unwrap();
+
+        app.receive_reply();
+
+        assert!(matches!(
+            &app.request_state,
+            RequestState::Failed(reason) if reason == "Список недоступен"
+        ));
+        assert_eq!(app.api_model, "model");
     }
 
     #[test]
